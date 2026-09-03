@@ -3050,13 +3050,13 @@ def api_option_chain():
     if not dt or not expiry:
         return jsonify({"error": "date and expiry required"}), 400
 
-    # Convert expiry to YYMMDD code
+    # Convert expiry to DDMMMYY code (MCX symbol format, e.g. "19SEP26")
     try:
-        exp_code = datetime.strptime(expiry, "%Y-%m-%d").strftime("%y%m%d")
+        exp_code = datetime.strptime(expiry, "%Y-%m-%d").strftime("%d%b%y").upper()
     except ValueError:
         return jsonify({"error": "invalid expiry format"}), 400
 
-    pattern = f"NIFTY{exp_code}%"
+    pattern = f"{PRIMARY_UNDERLYING}{exp_code}%"
 
     # Try minute_candles first (1-min bars aggregated to day-end snapshot)
     df = read_sql(
@@ -3087,9 +3087,10 @@ def api_option_chain():
 
     import re
     chain = []
+    sym_re = re.compile(rf"{re.escape(PRIMARY_UNDERLYING)}\d{{2}}[A-Z]{{3}}\d{{2}}(\d+)(CE|PE)")
     for _, r in df.iterrows():
         sym = r["symbol"]
-        m = re.match(r"NIFTY\d{6}(\d+)(CE|PE)", sym)
+        m = sym_re.match(sym)
         if m:
             chain.append({
                 "symbol": sym,
