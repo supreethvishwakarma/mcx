@@ -1,18 +1,32 @@
 """
 Load Historical CSV Data into TimescaleDB
 ──────────────────────────────────────────
-Reads all CSV files from data/historical/ and bulk-inserts them into
-the appropriate TimescaleDB hypertables.
+Reads CSV files from a data directory and bulk-inserts them into the
+appropriate hypertables, auto-detecting minute-bar vs. tick shape by
+columns present (no fixed filenames — the NIFTY-specific version this
+was ported from expected exact names like "nifty_index_1m.csv" and
+silently loaded nothing if your files were named differently, e.g.
+"crudeoil_1m.csv"). The `symbol` column inside each CSV is read as-is
+and written straight through — works for any underlying's symbol
+strings without code changes.
 
-Mapping:
-  nifty_index_1m.csv           → minute_candles
-  nifty_options_1m/*.csv       → minute_candles
-  nifty_index_ticks.csv        → tick_data
-  nifty_options_ticks/*.csv    → tick_data
+Minute bars go through database.db.upsert_candles() (ON CONFLICT DO
+NOTHING on symbol+timestamp) — safe to re-run, won't duplicate or crash
+on overlapping data. Tick data has no such constraint in schema.sql, so
+avoid loading the same tick file twice.
 
-Run: python scripts/load_csv_to_db.py
+**Existing data is never truncated unless you explicitly pass --truncate.**
+The version this was ported from truncated minute_candles AND tick_data
+unconditionally whenever either table had any rows — a real risk once
+you have live-collected or previously-imported data sitting there.
+
+Usage:
+  python scripts/load_csv_to_db.py --dir data/historical
+  python scripts/load_csv_to_db.py --dir data/historical --truncate   # wipe first
+  python scripts/load_csv_to_db.py --files crude_1m.csv gold_ticks.csv
 """
 
+import argparse
 import os
 import sys
 import time
@@ -27,26 +41,41 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
-from database.db import get_engine, init_db, execute_sql
+from database.db import get_engine, init_db, execute_sql, upsert_candles
 from utils.logger import get_logger
 
 logger = get_logger("csv_to_db")
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "historical"
+DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "historical"
+
+MINUTE_BAR_COLUMNS = {"open", "high", "low", "close"}
+TICK_COLUMNS = {"price"}
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+def _classify_csv(path: Path) -> str:
+    """Return 'minute_bars', 'ticks', or 'unknown' based on the header row."""
+    try:
+        header = pd.read_csv(path, nrows=0).columns.str.lower().tolist()
+    except Exception as e:
+        logger.warning(f"  {path.name}: couldn't read header ({e}), skipping")
+        return "unknown"
+    cols = set(header)
+    if MINUTE_BAR_COLUMNS.issubset(cols):
+        return "minute_bars"
+    if TICK_COLUMNS.issubset(cols):
+        return "ticks"
+    return "unknown"
 
-def load_minute_bars(engine, csv_path: Path, batch_label: str):
-    """Load a 1-min bar CSV into the minute_candles hypertable."""
+
+def load_minute_bars(engine, csv_path: Path) -> int:
+    """Load a 1-min bar CSV into minute_candles via upsert_candles() (safe to re-run)."""
     df = pd.read_csv(csv_path)
     if df.empty:
-        logger.warning(f"  {batch_label}: empty CSV, skipping")
+        logger.warning(f"  {csv_path.name}: empty CSV, skipping")
         return 0
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
-    # Compute VWAP if not present
     if "vwap" not in df.columns:
         typical = (df["high"] + df["low"] + df["close"]) / 3
         cum_tp_vol = (typical * df["volume"]).cumsum()
@@ -57,156 +86,113 @@ def load_minute_bars(engine, csv_path: Path, batch_label: str):
     if "oi" in df.columns:
         cols.append("oi")
 
-    df[cols].to_sql(
-        "minute_candles", engine,
-        if_exists="append", index=False, method="multi",
-        chunksize=5000,
-    )
-    return len(df)
+    return upsert_candles(df[cols], table="minute_candles")
 
 
-def load_tick_data(engine, csv_path: Path, batch_label: str):
-    """Load a tick CSV into the tick_data hypertable."""
+def load_tick_data(engine, csv_path: Path) -> int:
+    """Load a tick CSV into tick_data. No unique constraint on this table —
+    avoid loading the same file twice (it will duplicate rows, not error)."""
     df = pd.read_csv(csv_path)
     if df.empty:
-        logger.warning(f"  {batch_label}: empty CSV, skipping")
+        logger.warning(f"  {csv_path.name}: empty CSV, skipping")
         return 0
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
-    # Map CSV columns to tick_data schema
-    cols_map = {
-        "timestamp": "timestamp",
-        "symbol": "symbol",
-        "price": "price",
-        "volume": "volume",
-        "oi": "oi",
-        "bid_price": "bid_price",
-        "ask_price": "ask_price",
-        "bid_qty": "bid_qty",
-        "ask_qty": "ask_qty",
-    }
-
+    cols_map = ["timestamp", "symbol", "price", "volume", "oi",
+                "bid_price", "ask_price", "bid_qty", "ask_qty"]
     out = pd.DataFrame()
-    for csv_col, db_col in cols_map.items():
-        if csv_col in df.columns:
-            out[db_col] = df[csv_col]
-        else:
-            out[db_col] = None
+    for col in cols_map:
+        out[col] = df[col] if col in df.columns else None
 
-    out.to_sql(
-        "tick_data", engine,
-        if_exists="append", index=False, method="multi",
-        chunksize=5000,
-    )
+    out.to_sql("tick_data", engine, if_exists="append", index=False,
+               method="multi", chunksize=5000)
     return len(out)
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
-
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dir", type=Path, default=DEFAULT_DATA_DIR,
+                         help=f"Directory to scan recursively for CSVs (default: {DEFAULT_DATA_DIR})")
+    parser.add_argument("--files", nargs="+", type=Path, default=None,
+                         help="Explicit list of CSV files instead of scanning --dir")
+    parser.add_argument("--truncate", action="store_true",
+                         help="Wipe minute_candles and tick_data before loading. "
+                              "Without this flag, existing data is left alone and new "
+                              "rows are added on top (minute bars upsert safely; avoid "
+                              "re-loading the same tick file twice).")
+    args = parser.parse_args()
+
     print("\n" + "=" * 60)
     print("  CSV → TimescaleDB Loader")
     print("=" * 60)
-    print(f"  Data dir: {DATA_DIR}")
 
     engine = get_engine()
-
-    # Verify connection
     with engine.connect() as conn:
-        result = conn.execute(text("SELECT 1"))
-        result.fetchone()
+        conn.execute(text("SELECT 1"))
     logger.info("Database connection verified.")
 
-    # Initialize schema (idempotent)
     init_db()
 
-    # Check if tables already have data
     with engine.connect() as conn:
         mc_count = conn.execute(text("SELECT COUNT(*) FROM minute_candles")).scalar()
         td_count = conn.execute(text("SELECT COUNT(*) FROM tick_data")).scalar()
     logger.info(f"Current DB state: minute_candles={mc_count:,} rows, tick_data={td_count:,} rows")
 
-    if mc_count > 0 or td_count > 0:
-        logger.warning("Tables already contain data. Truncating before reload...")
-        execute_sql("TRUNCATE minute_candles")
-        execute_sql("TRUNCATE tick_data")
-        logger.info("Tables truncated.")
+    if args.truncate:
+        if mc_count > 0 or td_count > 0:
+            logger.warning("--truncate passed: wiping minute_candles and tick_data before loading.")
+            execute_sql("TRUNCATE minute_candles")
+            execute_sql("TRUNCATE tick_data")
+    elif mc_count > 0 or td_count > 0:
+        logger.info("Existing data found — leaving it in place (pass --truncate to wipe first).")
 
-    stats = {
-        "minute_bars_loaded": 0,
-        "minute_files": 0,
-        "tick_rows_loaded": 0,
-        "tick_files": 0,
-    }
+    if args.files:
+        csv_files = [Path(f) for f in args.files]
+    else:
+        if not args.dir.exists():
+            logger.error(f"Data directory does not exist: {args.dir}")
+            sys.exit(1)
+        csv_files = sorted(args.dir.rglob("*.csv"))
+        logger.info(f"Scanning {args.dir} — found {len(csv_files)} CSV file(s).")
+
+    stats = {"minute_bars_loaded": 0, "minute_files": 0, "tick_rows_loaded": 0, "tick_files": 0, "skipped": 0}
     t0 = time.time()
 
-    # ── 1. Load index 1-min bars ──────────────────────────────────────────────
-    index_csv = DATA_DIR / "nifty_index_1m.csv"
-    if index_csv.exists():
-        logger.info(f"\n  Loading index 1-min bars: {index_csv.name}")
-        n = load_minute_bars(engine, index_csv, "index_1m")
-        stats["minute_bars_loaded"] += n
-        stats["minute_files"] += 1
-        logger.info(f"    → {n:,} rows inserted")
-
-    # ── 2. Load option 1-min bars ─────────────────────────────────────────────
-    opt_dir = DATA_DIR / "nifty_options_1m"
-    if opt_dir.exists():
-        opt_files = sorted(opt_dir.glob("*.csv"))
-        logger.info(f"\n  Loading {len(opt_files)} option 1-min bar files...")
-        for i, f in enumerate(opt_files):
-            n = load_minute_bars(engine, f, f.stem)
+    for f in csv_files:
+        kind = _classify_csv(f)
+        if kind == "minute_bars":
+            n = load_minute_bars(engine, f)
             stats["minute_bars_loaded"] += n
             stats["minute_files"] += 1
-            if (i + 1) % 50 == 0 or (i + 1) == len(opt_files):
-                logger.info(f"    Progress: {i+1}/{len(opt_files)} files, {stats['minute_bars_loaded']:,} total rows")
-
-    # ── 3. Load index ticks ───────────────────────────────────────────────────
-    tick_csv = DATA_DIR / "nifty_index_ticks.csv"
-    if tick_csv.exists():
-        logger.info(f"\n  Loading index ticks: {tick_csv.name}")
-        n = load_tick_data(engine, tick_csv, "index_ticks")
-        stats["tick_rows_loaded"] += n
-        stats["tick_files"] += 1
-        logger.info(f"    → {n:,} rows inserted")
-
-    # ── 4. Load option ticks ──────────────────────────────────────────────────
-    opt_tick_dir = DATA_DIR / "nifty_options_ticks"
-    if opt_tick_dir.exists():
-        tick_files = sorted(opt_tick_dir.glob("*.csv"))
-        logger.info(f"\n  Loading {len(tick_files)} option tick files...")
-        for i, f in enumerate(tick_files):
-            n = load_tick_data(engine, f, f.stem)
+            logger.info(f"  {f.name}: {n:,} minute-bar rows")
+        elif kind == "ticks":
+            n = load_tick_data(engine, f)
             stats["tick_rows_loaded"] += n
             stats["tick_files"] += 1
-            if (i + 1) % 5 == 0 or (i + 1) == len(tick_files):
-                logger.info(f"    Progress: {i+1}/{len(tick_files)} files, {stats['tick_rows_loaded']:,} total rows")
+            logger.info(f"  {f.name}: {n:,} tick rows")
+        else:
+            logger.warning(f"  {f.name}: columns don't match minute-bar or tick shape, skipping")
+            stats["skipped"] += 1
 
     elapsed = time.time() - t0
 
-    # ── Verify ────────────────────────────────────────────────────────────────
     with engine.connect() as conn:
         mc_final = conn.execute(text("SELECT COUNT(*) FROM minute_candles")).scalar()
         td_final = conn.execute(text("SELECT COUNT(*) FROM tick_data")).scalar()
         mc_symbols = conn.execute(text("SELECT COUNT(DISTINCT symbol) FROM minute_candles")).scalar()
         td_symbols = conn.execute(text("SELECT COUNT(DISTINCT symbol) FROM tick_data")).scalar()
-        mc_range = conn.execute(text(
-            "SELECT MIN(timestamp), MAX(timestamp) FROM minute_candles"
-        )).fetchone()
+        mc_range = conn.execute(text("SELECT MIN(timestamp), MAX(timestamp) FROM minute_candles")).fetchone()
 
     print("\n" + "=" * 60)
     print("  LOAD COMPLETE")
     print("=" * 60)
-    print(f"  Time: {elapsed:.1f}s")
+    print(f"  Time: {elapsed:.1f}s  |  Files skipped (unrecognized shape): {stats['skipped']}")
     print(f"\n  minute_candles:")
-    print(f"    Rows: {mc_final:,}")
-    print(f"    Symbols: {mc_symbols}")
-    print(f"    Range: {mc_range[0]} → {mc_range[1]}")
+    print(f"    Rows: {mc_final:,}  |  Symbols: {mc_symbols}  |  Range: {mc_range[0]} → {mc_range[1]}")
     print(f"    Files loaded: {stats['minute_files']}")
     print(f"\n  tick_data:")
-    print(f"    Rows: {td_final:,}")
-    print(f"    Symbols: {td_symbols}")
+    print(f"    Rows: {td_final:,}  |  Symbols: {td_symbols}")
     print(f"    Files loaded: {stats['tick_files']}")
     print("=" * 60 + "\n")
 
