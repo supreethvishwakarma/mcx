@@ -5,7 +5,8 @@ Trains strategy-specific XGBoost models using ACTUAL trade outcomes
 from backtest CSVs, instead of synthetic forward-return labels.
 
 For each trade in the CSVs:
-  - Fetch the NIFTY-I candle at entry_time from minute_candles
+  - Fetch the underlying's candle at entry_time from minute_candles
+    (config.settings.PRIMARY_UNDERLYING, e.g. "CRUDEOIL-I")
   - Compute macro indicators → 50-feature vector (same as live scoring)
   - Label: 1 = profitable (TRAILING_SL / TIMEOUT / RL_EXIT / TARGET / pnl>0)
            0 = loss (SL hit / pnl<=0)
@@ -99,9 +100,9 @@ def build_label(row: pd.Series) -> int:
     return 0
 
 
-def fetch_features_at_entry(entry_times: list) -> pd.DataFrame:
+def fetch_features_at_entry(entry_times: list, symbol: str = None) -> pd.DataFrame:
     """
-    Fetch a window of NIFTY-I candles ending at each entry time and
+    Fetch a window of underlying candles ending at each entry time and
     compute macro indicators. Returns a DataFrame with a '_entry_time' column.
 
     Both CSV and DB timestamps are IST stored with +00:00 label — no conversion.
@@ -109,10 +110,14 @@ def fetch_features_at_entry(entry_times: list) -> pd.DataFrame:
     if not entry_times:
         return pd.DataFrame()
 
+    if symbol is None:
+        from config.settings import PRIMARY_UNDERLYING
+        symbol = f"{PRIMARY_UNDERLYING}-I"
+
     earliest = min(entry_times)
     warm_start = earliest - timedelta(hours=6)
 
-    logger.info(f"  Fetching candles from {warm_start.strftime('%Y-%m-%d %H:%M')}...")
+    logger.info(f"  Fetching {symbol} candles from {warm_start.strftime('%Y-%m-%d %H:%M')}...")
     candles = read_sql(
         """
         SELECT * FROM minute_candles
@@ -122,7 +127,7 @@ def fetch_features_at_entry(entry_times: list) -> pd.DataFrame:
         ORDER BY timestamp
         """,
         {
-            "sym": "NIFTY-I",
+            "sym": symbol,
             "from_ts": warm_start,
             "to_ts": max(entry_times) + timedelta(minutes=2),
         },

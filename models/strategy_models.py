@@ -61,6 +61,7 @@ def _get_model(model_type: str = "xgboost", **kwargs):
 def generate_strategy_labels(
     df: pd.DataFrame,
     strategy_name: str,
+    symbol: str = None,
     forward_periods: int = 40,
     sl_pct: float = 0.003,
     tgt_pct: float = 0.008,
@@ -70,14 +71,27 @@ def generate_strategy_labels(
 
     For each row where the strategy signal fires:
       - Look forward `forward_periods` bars (matches max_hold_bars=40)
-      - Check if NIFTY price hit target before stop
+      - Check if price hit target before stop
       - sl_pct=0.3%, tgt_pct=0.8% approximate real option RR (~2.5x) via delta
-        (ATM delta≈0.45: 15% option SL ≈ 0.3% NIFTY move; 50% option TGT ≈ 0.8%)
+        (ATM delta≈0.45: 15% option SL ≈ 0.3% underlying move; 50% option TGT ≈ 0.8%)
+        — this ratio was derived from NIFTY option deltas and is NOT
+        recalibrated for commodity options; re-derive before trusting labels.
       - Direction comes from the actual signal (handles mean_reversion CALL/PUT)
       - Label 1 if strategy would have been profitable, 0 otherwise
 
+    `symbol` is passed to the strategy function so symbol-gated strategies
+    (e.g. crude_inventory_volatility_breakout, which only fires for
+    CRUDEOIL) actually get evaluated — defaults to
+    config.settings.PRIMARY_UNDERLYING + "-I" if not given. Passing a fixed
+    "NIFTY-I" here (as this project's NIFTY sibling did) would silently
+    exclude every commodity-gated strategy from training data.
+
     For rows where the strategy doesn't fire: excluded from training.
     """
+    if symbol is None:
+        from config.settings import PRIMARY_UNDERLYING
+        symbol = f"{PRIMARY_UNDERLYING}-I"
+
     df = df.copy()
     strategy_func = STRATEGY_MAP.get(strategy_name)
     if strategy_func is None:
@@ -89,7 +103,7 @@ def generate_strategy_labels(
     directions = []
     for i, row in df.iterrows():
         row_dict = row.to_dict()
-        signal = strategy_func(row_dict, "NIFTY-I")
+        signal = strategy_func(row_dict, symbol)
         fires.append(signal is not None)
         directions.append(signal.direction if signal is not None else None)
 
@@ -154,6 +168,7 @@ def generate_strategy_labels(
 def train_strategy_model(
     features_df: pd.DataFrame,
     strategy_name: str,
+    symbol: str = None,
     model_type: str = "xgboost",
 ) -> Optional[Dict]:
     """Train a strategy-specific model."""
@@ -161,7 +176,7 @@ def train_strategy_model(
     logger.info(f"Training model for: {strategy_name}")
     logger.info(f"{'='*40}")
 
-    df = generate_strategy_labels(features_df, strategy_name)
+    df = generate_strategy_labels(features_df, strategy_name, symbol=symbol)
     if df.empty or len(df) < 50:
         logger.warning(f"Not enough data for {strategy_name} ({len(df)} samples)")
         return None

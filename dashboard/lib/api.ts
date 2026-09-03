@@ -181,6 +181,19 @@ export interface RLStatus {
   dqn?: { episodes: number; training_steps: number; epsilon: number; params: number };
 }
 
+export interface ModelFileInfo {
+  exists: boolean;
+  size_bytes?: number;
+  trained_at?: string;
+}
+
+export interface ModelsStatus {
+  macro: { loaded: boolean; feature_count: number; file: ModelFileInfo };
+  micro: { loaded: boolean; feature_count: number; file: ModelFileInfo };
+  strategy_models: { loaded: string[]; count: number };
+  primary_underlying: string;
+}
+
 export interface RiskProfile {
   name: string;
   base_lot_size: number;

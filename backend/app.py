@@ -40,7 +40,7 @@ from backtest.mcx_option_resolver import get_nearest_expiry, get_days_to_expiry
 from config.settings import PRIMARY_UNDERLYING
 from config.settings import (
     WEIGHT_ML_PROBABILITY, WEIGHT_OPTIONS_FLOW, WEIGHT_TECHNICAL_STRENGTH,
-    SCORE_THRESHOLD,
+    SCORE_THRESHOLD, MACRO_MODEL_PATH, MICRO_MODEL_PATH,
 )
 from utils.logger import get_logger
 from utils.helpers import now_ist, is_market_open
@@ -2744,6 +2744,43 @@ def api_risk_profiles():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/models/status")
+def api_models_status():
+    """
+    Real status for the macro/micro/strategy models — no fabricated stats.
+    Returns null/false for anything not actually trained yet.
+    """
+    import os as _os
+
+    def _file_info(path):
+        try:
+            if _os.path.exists(path):
+                st = _os.stat(path)
+                return {"exists": True, "size_bytes": st.st_size,
+                        "trained_at": datetime.fromtimestamp(st.st_mtime).isoformat()}
+        except Exception:
+            pass
+        return {"exists": False}
+
+    return jsonify({
+        "macro": {
+            "loaded": predictor._macro_model is not None,
+            "feature_count": len(predictor._macro_features) if predictor._macro_model else 0,
+            "file": _file_info(MACRO_MODEL_PATH),
+        },
+        "micro": {
+            "loaded": predictor._micro_model is not None,
+            "feature_count": len(predictor._micro_features) if predictor._micro_model else 0,
+            "file": _file_info(MICRO_MODEL_PATH),
+        },
+        "strategy_models": {
+            "loaded": strategy_predictor.available_strategies,
+            "count": len(strategy_predictor.available_strategies),
+        },
+        "primary_underlying": PRIMARY_UNDERLYING,
+    })
 
 
 @app.route("/api/rl/status")
