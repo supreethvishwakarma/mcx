@@ -1,0 +1,17 @@
+{
+  "name": "ai-trader (paper trading dashboard)",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": { "version": "20" }
+  },
+  "containerEnv": {
+    "TZ": "Asia/Kolkata"
+  },
+  "postCreateCommand": "bash .devcontainer/setup.sh",
+  "postStartCommand": "bash .devcontainer/start.sh",
+  "forwardPorts": [3000, 5050],
+  "portsAttributes": {
+    "3000": { "label": "Dashboard", "onAutoForward": "openBrowser" },
+    "5050": { "label": "Flask API", "onAutoForward": "silent" }
+  }
+}

@@ -1,0 +1,44 @@
+# Core
+pandas>=2.0
+numpy>=1.24
+python-dotenv>=1.0
+
+# Database
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
+
+# Backend API
+flask>=3.0
+flask-cors>=4.0
+
+# ML
+scikit-learn>=1.3
+xgboost>=2.0
+lightgbm>=4.0
+joblib>=1.3
+
+# Technical Analysis
+# NOTE: the original `pandas-ta` package is unmaintained and its only
+# PyPI releases now require Python >= 3.12. `pandas-ta-classic` is the
+# actively maintained, API-compatible fork (same `pandas_ta` functions) —
+# install it, then put a 1-line shim on your PYTHONPATH so
+# `import pandas_ta` resolves to it:
+#   echo "from pandas_ta_classic import *" > $(python -c "import site; print(site.getsitepackages()[0])")/pandas_ta.py
+pandas-ta-classic>=0.6.52
+
+# Broker / Data
+smartapi-python>=1.4.8
+pyotp>=2.9
+websocket-client>=1.6
+requests>=2.31
+
+# TrueData (optional - for using official Python library instead of direct API)
+# truedata-ws>=1.0
+
+# News / Sentiment
+beautifulsoup4>=4.12
+python-dateutil>=2.8
+torch>=2.0
+
+# Logging / Utils
+colorama>=0.4
