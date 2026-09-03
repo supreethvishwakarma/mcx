@@ -164,16 +164,26 @@ class RegimeDetector:
 # ── Strategy Regime Mapping ───────────────────────────────────────────────────
 
 REGIME_STRATEGIES = {
-    # Trending regimes: primary directional strategy gets the bonus
-    MarketRegime.TRENDING_BULL: ["vwap_momentum_breakout"],
-    MarketRegime.TRENDING_BEAR: ["bearish_momentum"],
+    # Trending regimes: primary directional strategy gets the bonus.
+    # precious_metals_trend_momentum self-filters to GOLD/SILVER symbols only
+    # (see strategy/signal_generator.py) so it's safe to list unconditionally.
+    MarketRegime.TRENDING_BULL: ["vwap_momentum_breakout", "precious_metals_trend_momentum"],
+    MarketRegime.TRENDING_BEAR: ["bearish_momentum", "precious_metals_trend_momentum"],
     # Sideways: mean_reversion is primary, but momentum breakouts/breakdowns are valid too
     # (NIFTY can grind down from a sideways range — bearish_momentum is a real sideways setup)
     MarketRegime.SIDEWAYS: ["mean_reversion", "bearish_momentum", "vwap_momentum_breakout"],
-    # High-vol: both reversion and momentum are valid (fast moves in both directions)
-    MarketRegime.HIGH_VOLATILITY: ["mean_reversion", "bearish_momentum", "vwap_momentum_breakout"],
+    # High-vol: both reversion and momentum are valid (fast moves in both directions).
+    # crude_inventory_volatility_breakout self-filters to CRUDEOIL + the EIA
+    # report time window, so it's a no-op outside that window.
+    MarketRegime.HIGH_VOLATILITY: [
+        "mean_reversion", "bearish_momentum", "vwap_momentum_breakout",
+        "crude_inventory_volatility_breakout",
+    ],
     MarketRegime.LOW_VOLATILITY: ["vwap_momentum_breakout"],
-    MarketRegime.UNKNOWN: ["vwap_momentum_breakout", "bearish_momentum", "mean_reversion"],
+    MarketRegime.UNKNOWN: [
+        "vwap_momentum_breakout", "bearish_momentum", "mean_reversion",
+        "crude_inventory_volatility_breakout", "precious_metals_trend_momentum",
+    ],
 }
 
 

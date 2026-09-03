@@ -24,6 +24,8 @@ from broker.base_adapter import (
     OrderType,
     Position,
 )
+from broker.qty_freeze import get_freeze_qty, split_order_quantity
+from config.settings import SYMBOLS
 from utils.logger import get_logger
 
 logger = get_logger("paper_adapter")
@@ -61,6 +63,18 @@ class PaperAdapter(BrokerAdapter):
     # ── Order Placement ───────────────────────────────────────────────
 
     def place_order(self, request: OrderRequest) -> OrderResponse:
+        # Paper fills don't need splitting (nothing to reject them), but flag
+        # when a live Angel One order of this size WOULD be split, so testing
+        # in paper mode surfaces the constraint before it's a live surprise.
+        underlying = next((s for s in SYMBOLS if request.symbol.upper().startswith(s)), None)
+        if underlying:
+            chunks = split_order_quantity(request.quantity, get_freeze_qty(underlying))
+            if len(chunks) > 1:
+                logger.warning(
+                    f"Paper order {request.symbol} ×{request.quantity} would be split into "
+                    f"{len(chunks)} orders on Angel One (freeze qty limit for {underlying}): {chunks}"
+                )
+
         order_id = f"PAPER-{uuid.uuid4().hex[:12]}"
         now = datetime.now()
 

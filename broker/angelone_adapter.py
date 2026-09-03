@@ -42,6 +42,8 @@ from broker.base_adapter import (
     Position,
     ProductType,
 )
+from broker.qty_freeze import get_freeze_qty, split_order_quantity
+from config.settings import SYMBOLS
 from utils.logger import get_logger
 
 logger = get_logger("angelone_adapter")
@@ -226,9 +228,31 @@ class AngelOneAdapter(BrokerAdapter):
     # ── Order Placement ───────────────────────────────────────────────
 
     def place_order(self, request: OrderRequest) -> OrderResponse:
+        """
+        Places the order, splitting into multiple exchange orders if
+        `request.quantity` exceeds MCX's freeze quantity for the underlying
+        (see broker/qty_freeze.py — unconfigured underlyings fail open, no
+        splitting applied, so an oversized order is simply rejected by the
+        exchange rather than silently mis-split).
+        """
         if not self.is_connected:
             return OrderResponse(status=OrderStatus.ERROR, message="Not connected to Angel One")
 
+        underlying = next((s for s in SYMBOLS if request.symbol.upper().startswith(s)), None)
+        freeze_qty = get_freeze_qty(underlying) if underlying else None
+        chunks = split_order_quantity(request.quantity, freeze_qty)
+
+        if len(chunks) > 1:
+            logger.info(
+                f"Angel One ORDER SPLIT: {request.symbol} ×{request.quantity} "
+                f"exceeds freeze qty {freeze_qty} for {underlying} — splitting into "
+                f"{len(chunks)} orders: {chunks}"
+            )
+
+        responses = [self._place_single_order(request, qty) for qty in chunks]
+        return self._aggregate_split_responses(responses, chunks)
+
+    def _place_single_order(self, request: OrderRequest, quantity: int) -> OrderResponse:
         try:
             symbol_token = self._get_symbol_token(request.symbol, request.exchange)
 
@@ -241,7 +265,7 @@ class AngelOneAdapter(BrokerAdapter):
                 "ordertype": _ORDER_TYPE_MAP.get(request.order_type, "MARKET"),
                 "producttype": _PRODUCT_MAP.get(request.product, "INTRADAY"),
                 "duration": "DAY",
-                "quantity": str(request.quantity),
+                "quantity": str(quantity),
                 "price": str(request.price) if request.price else "0",
                 "squareoff": "0",
                 "stoploss": "0",
@@ -255,7 +279,7 @@ class AngelOneAdapter(BrokerAdapter):
 
             logger.info(
                 f"Angel One ORDER: {request.side.value} {request.symbol} "
-                f"×{request.quantity} [{request.order_type.value}] → {order_id}"
+                f"×{quantity} [{request.order_type.value}] → {order_id}"
             )
 
             return OrderResponse(
@@ -283,6 +307,25 @@ class AngelOneAdapter(BrokerAdapter):
                 message=error_msg,
                 timestamp=datetime.now(),
             )
+
+    @staticmethod
+    def _aggregate_split_responses(responses: list[OrderResponse], chunks: list[int]) -> OrderResponse:
+        """Collapse N split-order responses into one OrderResponse. The first
+        successful order's ID is primary (used for tracking/exit); all order
+        IDs are preserved in `raw['split_order_ids']` for reconciliation."""
+        if len(responses) == 1:
+            return responses[0]
+
+        ok = [r for r in responses if r.status != OrderStatus.ERROR and r.status != OrderStatus.REJECTED]
+        primary = ok[0] if ok else responses[0]
+        return OrderResponse(
+            order_id=primary.order_id,
+            status=primary.status if len(ok) == len(responses) else OrderStatus.ERROR,
+            filled_quantity=sum(c for r, c in zip(responses, chunks) if r.status == OrderStatus.OPEN),
+            message=f"Split into {len(responses)} orders ({len(ok)} succeeded): {[r.message for r in responses]}",
+            timestamp=datetime.now(),
+            raw={"split_order_ids": [r.order_id for r in responses], "chunks": chunks},
+        )
 
     def modify_order(
         self,
